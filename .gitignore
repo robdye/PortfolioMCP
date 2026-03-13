@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Environment / secrets
+.env
+
+# Deployment artefacts
+publish/
+publish.zip
+.azure/
+
+# Diagnostic archives
+logs/
+*.zip
+*.txt
+!requirements.txt
+!startup.sh
+!README.md
