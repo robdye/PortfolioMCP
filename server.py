@@ -139,6 +139,22 @@ async def _graph_patch(url: str, body: dict) -> dict:
     return resp.json()
 
 
+async def _graph_post(url: str, body: dict) -> dict:
+    """Authenticated POST against Microsoft Graph."""
+    token = await _get_graph_token()
+    client = _get_http_client()
+    resp = await client.post(
+        url,
+        json=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 # ---------------------------------------------------------------------------
 #  Workbook URL resolution
 # ---------------------------------------------------------------------------
@@ -559,6 +575,167 @@ async def remove_holding(ticker: str) -> str:
             return _format_action_md("removed", {"ticker": ticker, "company": str(row[0]) if row else ""})
 
     return f"⚠️ Ticker **{ticker}** was not found in your portfolio."
+
+
+# ---------------------------------------------------------------------------
+#  MCP Tools — Column Management
+# ---------------------------------------------------------------------------
+
+_COLUMN_NAME_RE = re.compile(r"^[A-Za-z0-9 _\-/.&()]{1,50}$")
+
+
+def _validate_column_name(name: str) -> str:
+    """Sanitise and validate a column name."""
+    name = name.strip()
+    if not name or not _COLUMN_NAME_RE.match(name):
+        raise ValueError(f"Invalid column name: {name!r}")
+    return name
+
+
+@mcp.tool()
+async def add_column(name: str) -> str:
+    """Add a new column to the portfolio table.
+
+    Adds a column header to the right of the last existing column.
+    The column is added to Table1 in the portfolio workbook.
+
+    Args:
+        name: Name for the new column header (e.g. 'Current Price', 'P/L %').
+    """
+    name = _validate_column_name(name)
+    wb_url = await _get_workbook_url()
+
+    # Get current table columns to find the next position
+    table_data = await _graph_get(f"{wb_url}/tables/Table1/columns")
+    existing_cols = table_data.get("value", [])
+    col_names = [c.get("name", "") for c in existing_cols]
+
+    if name in col_names:
+        return f"⚠️ Column **{name}** already exists in the table."
+
+    # Add column via the Table1 columns endpoint
+    result = await _graph_post(
+        f"{wb_url}/tables/Table1/columns",
+        {"name": name, "values": [[name]]},
+    )
+
+    col_index = result.get("index", len(existing_cols))
+    return (
+        f"✅ Column **{name}** added to the portfolio table.\n\n"
+        f"Column index: {col_index} (0-based)\n"
+        f"Total columns: {len(col_names) + 1}\n\n"
+        f"Use `update_column` to populate the column with values."
+    )
+
+
+@mcp.tool()
+async def update_column(col_index: int, values: list) -> str:
+    """Update all values in a portfolio table column.
+
+    Writes a complete set of values for a column identified by its
+    zero-based index.  The values array should include the header as
+    the first element, followed by one value per data row.
+
+    Example: update_column(8, [["Current Price"],["131.99"],["6.36"]])
+
+    Args:
+        col_index: Zero-based column index in Table1.
+        values:    2D array of values — [[header],[row1],[row2],...].
+    """
+    if col_index < 0:
+        return "⚠️ Column index must be >= 0."
+
+    wb_url = await _get_workbook_url()
+
+    # Validate column exists
+    table_data = await _graph_get(f"{wb_url}/tables/Table1/columns")
+    existing_cols = table_data.get("value", [])
+    if col_index >= len(existing_cols):
+        return (
+            f"⚠️ Column index {col_index} is out of range. "
+            f"Table has {len(existing_cols)} columns (0–{len(existing_cols) - 1})."
+        )
+
+    col_name = existing_cols[col_index].get("name", f"Column {col_index}")
+
+    # Write values to the column
+    # The Graph API expects the full column range including header
+    await _graph_patch(
+        f"{wb_url}/tables/Table1/columns/{col_index}/range",
+        {"values": values},
+    )
+
+    data_rows = len(values) - 1 if len(values) > 1 else 0
+    return (
+        f"✅ Column **{col_name}** (index {col_index}) updated.\n\n"
+        f"Wrote {data_rows} data value{'s' if data_rows != 1 else ''} "
+        f"(plus header).\n"
+    )
+
+
+@mcp.tool()
+async def list_columns() -> str:
+    """List all columns in the portfolio table with their indices.
+
+    Returns the column names and zero-based indices from Table1.
+    """
+    wb_url = await _get_workbook_url()
+    table_data = await _graph_get(f"{wb_url}/tables/Table1/columns")
+    existing_cols = table_data.get("value", [])
+
+    if not existing_cols:
+        return "The portfolio table has no columns."
+
+    lines = [
+        "## Portfolio Table Columns\n",
+        f"**{len(existing_cols)} columns** in Table1\n",
+        "| Index | Column Name |",
+        "|------:|-------------|",
+    ]
+    for col in existing_cols:
+        idx = col.get("index", "?")
+        name = col.get("name", "?")
+        lines.append(f"| {idx} | {name} |")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def rename_column(col_index: int, new_name: str) -> str:
+    """Rename a column in the portfolio table.
+
+    Args:
+        col_index: Zero-based column index to rename.
+        new_name:  New name for the column header.
+    """
+    new_name = _validate_column_name(new_name)
+    wb_url = await _get_workbook_url()
+
+    table_data = await _graph_get(f"{wb_url}/tables/Table1/columns")
+    existing_cols = table_data.get("value", [])
+    if col_index < 0 or col_index >= len(existing_cols):
+        return (
+            f"⚠️ Column index {col_index} is out of range. "
+            f"Table has {len(existing_cols)} columns (0–{len(existing_cols) - 1})."
+        )
+
+    old_name = existing_cols[col_index].get("name", "")
+
+    # Rename by updating the header cell
+    # Table columns are named by their header row
+    # Get header range for this column
+    header_data = await _graph_get(
+        f"{wb_url}/tables/Table1/columns/{col_index}/headerRowRange"
+    )
+    await _graph_patch(
+        f"{wb_url}/tables/Table1/columns/{col_index}/headerRowRange",
+        {"values": [[new_name]]},
+    )
+
+    return (
+        f"✅ Column renamed from **{old_name}** to **{new_name}** "
+        f"(index {col_index}).\n"
+    )
 
 
 # ---------------------------------------------------------------------------
